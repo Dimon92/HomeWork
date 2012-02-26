@@ -21,6 +21,6 @@ public class PoleChudes {
 			}
 			System.out.println(a);
 		}
-		System.out.println("Contragulations! You Win!");
+		System.out.println("Congratulations! You Win!");
 	}
 }
