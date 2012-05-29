@@ -14,23 +14,17 @@ public class VagnerAlg {
 		for (int i = 0; i <= m; i++) {
 			d[i][0] = i;
 		}
-		for (int i = 0; i <= n; i++) {
-			d[0][i] = i;
+		for (int j = 0; j <= n; i++) {
+			d[0][j] = j;
 		}
 		for (int i = 1; i <= m; i++) {
-			str1 = s1.substring(0, i);
 			for (int j = 1; j <= n; j++) {
-				str2 = s2.substring(0, j);
-
-				if (str1.charAt(i - 1) == str2.charAt(j - 1))
-					p = 0;
-
-				d[i][j] = Math.min(Math.min(d[i - 1][j], d[i][j - 1]),
-						d[i - 1][j - 1]) + p;
-			}
-			p = 1;
-
-		}
+		     if (s1.charAt(i - 1) == s2.charAt(j - 1))
+				p = 0;
+		     else  p = 1;
+                        d[i][j] = Math.min(Math.min(d[i - 1][j], d[i][j - 1]),d[i - 1][j - 1]) + p;
+		        }
+                 }
 		System.out.println(d[m][n]);
 	}
 
