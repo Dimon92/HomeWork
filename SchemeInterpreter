@@ -1,0 +1,125 @@
+module Main where
+-- импортирование библиотек
+import Text.ParserCombinators.Parsec hiding (spaces)
+import System.Environment
+import Control.Monad
+
+main :: IO ()
+main = getArgs >>= putStrLn . show . eval . readExpr . (!! 0)
+          
+-- перечисление всех символов,которые могут встретиться в выражении
+symbol :: Parser Char
+symbol = oneOf "+-*/=:<>?!$%&|@^~_"
+
+-- считывание выражения с консоли и вывод результата
+-- show преобразует все в строку
+readExpr :: String -> LispValues
+readExpr input = case parse parseExpr "lisp" input of
+	Right value -> value
+	-- вывод ошибки, если не найдено совпадений
+	Left err -> String $ "No match: " ++ show err    
+
+-- определение парсера,который распознает любое количество пробелов.
+-- в случае со skipMany1 количество пробелов может быть 1 или сколь угодно много
+spaces :: Parser ()
+spaces = skipMany1 space
+
+-- создание нового типа данных LispValues
+-- каждый конструктор(разделяется знаком "|") содержит тег для LispValues вместе с типом данных,
+-- который он может содержать
+data LispValues = Number Integer
+			 | Atom String
+			 | String String
+             | List [LispValues]
+             | DottedList [LispValues] LispValues
+			 | Bool Bool
+
+-- many1 матчит один или больше его аргументов, т.о. матчится одна или больше цифр
+-- read конвертирует строку в число
+-- liftM указывает, что надо использовать значение только внутри монады, возвращая нам Parser LispValues
+parseNumber :: Parser LispValues
+parseNumber = liftM (Number . read) $ many1 digit
+
+-- оператор выбора <|> сначала пытается распарсить левую часть, если получается - возвращает значение,
+-- если не получается, он пытается распарсить правую - аналогично
+-- many применяет парсер 0 или сколь угодно раз
+-- return возвращает либо булевскую переменную, либо атом
+parseAtom :: Parser LispValues
+parseAtom = do first <- letter <|> symbol
+               rest <- many (letter <|> digit <|> symbol)
+               let atom = [first] ++ rest
+               return $ case atom of 
+                          "#t" -> Bool True
+                          "#f" -> Bool False
+                          otherwise -> Atom atom
+
+-- строка начинается с кавычки и ею заканчивается
+-- noneOf помогает указать, что сама кавычка не входит в строку
+-- return возвращает всю строку
+parseString :: Parser LispValues
+parseString = do char '"'
+                 x <- many (noneOf "\"")
+                 char '"'
+                 return $ String x
+
+-- поочередная попытка распарсить выражения и при успехе - возвращение значения
+parseExpr :: Parser LispValues
+parseExpr = parseAtom
+        <|> parseString
+        <|> parseNumber
+		<|> parseQuoted
+		--проверка скобок в выражении
+        <|> do char '('
+               x <- (try parseList) <|> parseDottedList
+               char ')'
+               return x
+
+-- аналогично parseNumber, сначала парсятся выражения, разделенные пробелами,
+-- а потом к ним применяется конструктор List внутри монады Parser 
+parseList :: Parser LispValues
+parseList = liftM List $ sepBy parseExpr spaces
+
+-- в языке Lisp в dotted list символ "." разделяет голову(все элементы, кроме последнего)
+-- и хвост(последний элемент)
+-- "char '.' >> spaces" возвращает Parser(), потом, совмещая это с ParseExpr, дает Parser LispValues
+-- return возвращает DottedList c головой и хвостом
+parseDottedList :: Parser LispValues
+parseDottedList = do
+    head <- endBy parseExpr spaces
+    tail <- char '.' >> spaces >> parseExpr
+    return $ DottedList head tail
+
+-- считывается один символ "'"(апостроф), парсится выражение и связывается с "х"
+-- return возвращает List c атомом "quote" и выражением "х"
+parseQuoted :: Parser LispValues
+parseQuoted = do
+    char '\''
+    x <- parseExpr
+    return $ List [Atom "quote", x]
+
+-- указание, как выводить строки в зависимости от принимаемого конструктора 
+-- unwordsList конвертирует список в строку
+showValue :: LispValues -> String
+showValue (Number content) = show content
+showValue (Atom name) = name
+showValue (String content) = "\"" ++ content ++ "\""
+showValue (Bool True) = "#t"
+showValue (Bool False) = "#f"
+showValue (List content) = "(" ++ unwordsList content ++ ")"
+showValue (DottedList head tail) = "(" ++ unwordsList head ++ " . " ++ showValue tail ++ ")"
+
+-- сначала конвертируется LispValues в строковое представление, потом к нему применяется unwords
+-- "map showVal" конвертирует список LispValues в список его строковых представлений,
+-- потом unwords соединяет результат вместе с пробелами
+unwordsList :: [LispValues] -> String
+unwordsList = unwords . map showValue
+
+-- instance добавляет LispValues в члены класса Show и определение метода show как метод showValue
+instance Show LispValues where show = showValue
+
+--
+eval :: LispValues -> LispValues
+eval val@(String _) = value
+eval val@(Number _) = value
+eval val@(Bool _) = value
+eval (List [Atom "quote", value]) = value
