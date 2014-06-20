@@ -1,25 +1,34 @@
+{-# LANGUAGE ExistentialQuantification #-}
 module Main where
 -- импортирование библиотек
 import Text.ParserCombinators.Parsec hiding (spaces)
 import System.Environment
 import Control.Monad
+import Control.Monad.Error
+import System.IO hiding (try)
+import Data.IORef
 
+-- если аргументов нет,запускается консоль, если один аргумент - то выражение считается и выводится,
+-- в противном случае вывод сообщения
 main :: IO ()
-main = getArgs >>= putStrLn . show . eval . readExpr . (!! 0)
+main = do args <- getArgs
+          case length args of
+              0 -> runRepl
+              1 -> runOne $ args !! 0
+              otherwise -> putStrLn "Program takes only 0 or 1 argument"
           
 -- перечисление всех символов,которые могут встретиться в выражении
 symbol :: Parser Char
 symbol = oneOf "+-*/=:<>?!$%&|@^~_"
 
--- считывание выражения с консоли и вывод результата
--- show преобразует все в строку
-readExpr :: String -> LispValues
+-- считывание выражения с консоли, попытка парсинга и возвращение выражения
+readExpr :: String -> ThrowsError LispValues
 readExpr input = case parse parseExpr "lisp" input of
-	Right value -> value
-	-- вывод ошибки, если не найдено совпадений
-	Left err -> String $ "No match: " ++ show err    
-
--- определение парсера,который распознает любое количество пробелов.
+	-- выкидывание ошибки при неудаче
+	Left err -> throwError $ Parser err
+	Right value -> return value
+	    
+-- определение парсера, который распознает любое количество пробелов.
 -- в случае со skipMany1 количество пробелов может быть 1 или сколь угодно много
 spaces :: Parser ()
 spaces = skipMany1 space
@@ -30,9 +39,12 @@ spaces = skipMany1 space
 data LispValues = Number Integer
 			 | Atom String
 			 | String String
-             | List [LispValues]
-             | DottedList [LispValues] LispValues
+       | List [LispValues]
+       | DottedList [LispValues] LispValues
 			 | Bool Bool
+       | PrimitiveFunc ([LispValues] -> ThrowsError LispValues)
+       | Func {params :: [String], vararg :: (Maybe String), 
+                body :: [LispValues], closure :: Env}
 
 -- many1 матчит один или больше его аргументов, т.о. матчится одна или больше цифр
 -- read конвертирует строку в число
@@ -40,10 +52,10 @@ data LispValues = Number Integer
 parseNumber :: Parser LispValues
 parseNumber = liftM (Number . read) $ many1 digit
 
--- оператор выбора <|> сначала пытается распарсить левую часть, если получается - возвращает значение,
--- если не получается, он пытается распарсить правую - аналогично
+-- оператор выбора <|> сначала пытается распарсить первую часть, если получается - возвращает значение,
+-- если не получается, он пытается распарсить вторую - и т.д. аналогично
 -- many применяет парсер 0 или сколь угодно раз
--- return возвращает либо булевскую переменную, либо атом
+-- return возвращает либо булеву переменную, либо атом
 parseAtom :: Parser LispValues
 parseAtom = do first <- letter <|> symbol
                rest <- many (letter <|> digit <|> symbol)
@@ -107,19 +119,374 @@ showValue (Bool True) = "#t"
 showValue (Bool False) = "#f"
 showValue (List content) = "(" ++ unwordsList content ++ ")"
 showValue (DottedList head tail) = "(" ++ unwordsList head ++ " . " ++ showValue tail ++ ")"
-
+showValue (PrimitiveFunc _) = "<primitive>"
+showValue (Func {params = args, vararg = varargs, body = body, closure = env}) = 
+  "(lambda (" ++ unwords (map show args) ++ 
+     (case varargs of 
+        Nothing -> ""
+        Just arg -> " . " ++ arg) ++ ") ...)" 
 -- сначала конвертируется LispValues в строковое представление, потом к нему применяется unwords
--- "map showVal" конвертирует список LispValues в список его строковых представлений,
+-- "map showValue" поэлементно конвертирует список LispValues в список его строковых представлений,
 -- потом unwords соединяет результат вместе с пробелами
 unwordsList :: [LispValues] -> String
 unwordsList = unwords . map showValue
 
--- instance добавляет LispValues в члены класса Show и определение метода show как метод showValue
+-- instance добавляет LispValues в члены класса Show и определяет метод show как метод showValue
 instance Show LispValues where show = showValue
 
---
-eval :: LispValues -> LispValues
-eval val@(String _) = value
-eval val@(Number _) = value
-eval val@(Bool _) = value
-eval (List [Atom "quote", value]) = value
+-- к примеру, value@(String _) определяет, что любой элемент из LispValues - это строка,
+-- потом он связывает с value весь LispValue, а не только содержимое конструктора String
+-- результат имеет тип LispValues вместо типа String
+-- подчеркивание говорит, о том, что нам неважно, какая здесь будет переменная
+evaluate :: Env -> LispValues -> IOThrowsError LispValues
+evaluate env value@(Number _) = return value
+evaluate env value@(String _) = return value
+evaluate env value@(Bool _) = return value
+evaluate env (Atom id) = getVar env id
+-- Мы матчим несмотря на определенный список из двух элементов [Atom "quote", value] список,
+-- где первый элемент - символ "quote", а второй - может быть что угодно. 
+-- возвращается второй элемент
+evaluate env (List [Atom "quote", value]) = return value
+-- здесь принимается список из 4-х элементов, где первый - это слово "if",
+-- второй - предикат(условие, которое будет проверяться),
+-- третий - выполнение функции "evaluate conseq", если результат метода "evaluate pred" вернет true,
+-- четвертый - выполнение функции "evaluate alt", если результат метода "evaluate pred" вернет false
+evaluate env (List [Atom "if", pred, conseq, alt]) = 
+    do result <- evaluate env pred
+       case result of
+         Bool False -> evaluate env alt
+         otherwise -> evaluate env conseq
+--монадический "bind" передает результат в среду
+evaluate env (List [Atom "set!", Atom var, form]) =
+    evaluate env form >>= setVar env var
+evaluate env (List [Atom "define", Atom var, form]) =
+    evaluate env form >>= defineVar env var
+evaluate env (List (Atom "define" : List (Atom var : params) : body)) =
+    makeNormalFunc env params body >>= defineVar env var
+evaluate env (List (Atom "define" : DottedList (Atom var : params) varargs : body)) =
+    makeVarargs varargs env params body >>= defineVar env var
+evaluate env (List (Atom "lambda" : List params : body)) =
+    makeNormalFunc env params body
+evaluate env (List (Atom "lambda" : DottedList params varargs : body)) =
+    makeVarargs varargs env params body
+evaluate env (List (Atom "lambda" : varargs@(Atom _) : body)) =
+    makeVarargs varargs env [] body
+-- двоеточие добавляет элемент слева списка т.е. в его начало
+-- mapM мапит монадическую функцию над списком значений, последовательностями результирующих действий
+evaluate env (List (function : args)) = do 
+    func <- evaluate env function
+    argVals <- mapM (evaluate env) args
+    apply func argVals
+-- выкидывание ошибки, если не получается распознать
+evaluate env badForm = throwError $ BadSpecialForm "Unrecognized special form" badForm
+
+-- применение функций к аргументам
+apply :: LispValues -> [LispValues] -> IOThrowsError LispValues
+apply (PrimitiveFunc func) args = liftThrows $ func args
+apply (Func params varargs body closure) args = 
+    if num params /= num args && varargs == Nothing
+       then throwError $ NumArgs (num params) args
+       else (liftIO $ bindVars closure $ zip params args) >>= bindVarArgs varargs >>= evalBody
+    where remainingArgs = drop (length params) args
+          num = toInteger . length
+          evalBody env = liftM last $ mapM (evaluate env) body 
+          bindVarArgs arg env = case arg of
+              Just argName -> liftIO $ bindVars env [(argName, List $ remainingArgs)]
+              Nothing -> return env 
+
+-- список пар, где значения - это строки и функции из [LispValues] в LispValues
+primitives :: [(String, [LispValues] -> ThrowsError LispValues)]
+primitives = [("+", numBinOp (+)),
+              ("-", numBinOp (-)),
+              ("*", numBinOp (*)),
+              ("/", numBinOp div),
+              ("mod", numBinOp mod),
+              ("quotient", numBinOp quot),
+              ("remainder", numBinOp rem),
+              ("=", numBoolBinOp (==)),
+              ("<", numBoolBinOp (<)),
+              (">", numBoolBinOp (>)),
+              ("/=", numBoolBinOp (/=)),
+              (">=", numBoolBinOp (>=)),
+              ("<=", numBoolBinOp (<=)),
+              ("&&", boolBoolBinOp (&&)),
+              ("||", boolBoolBinOp (||)),
+              ("string=?", strBoolBinOp (==)),
+              ("string?", strBoolBinOp (>)),
+              ("string<=?", strBoolBinOp (<=)),
+              ("string>=?", strBoolBinOp (>=)),
+              ("car", car),
+              ("cdr", cdr),
+              ("cons", cons),
+              ("eq?", eqv),
+              ("eqv?", eqv),
+              ("equal?", equal)]
+
+-- foldl1 берет первые 2 элемента из списка и применяет к ним функцию,
+-- затем выдает ее с результатом и третим аргументом и так далее рекурсивно
+-- в итоге принимается функция и оборачивается в список аргументов, затем к ней применяется функция,
+-- и результат оборачивается в конструктор Number
+numBinOp :: (Integer -> Integer -> Integer) -> [LispValues] -> ThrowsError LispValues
+-- выкидывание ошибки, если найден только один аргумент
+numBinop op singleValue@[_] = throwError $ NumArgs 2 singleValue
+-- mapM мапит монадическую функцию над списком значений, последовательностями результирующих действий,
+-- затем монадический "bind" передает результат в конструктор Number
+numBinOp op params = mapM unpackNum params >>= return . Number . foldl1 op
+
+-- принимается 2 функции как первые 2 аргумента: первая распаковывает аргументы из LispValues в родные типы
+-- языка Haskell, а вторая - выполняет функцию,
+-- которая принимает ровно 2 аргумента и возвращает булево значение или выкидывает ошибку,
+-- если количество аргументов не равно двум
+boolBinOp :: (LispValues -> ThrowsError a) -> (a -> a -> Bool) -> [LispValues] -> ThrowsError LispValues
+boolBinOp unpacker op args = if length args /= 2 
+							 -- выкидывание ошибки
+                             then throwError $ NumArgs 2 args
+                             -- распаковка нулевого и первого элементов
+                             -- `op` - инфиксная форма записи функции
+                             else do left <- unpacker $ args !! 0
+                                     right <- unpacker $ args !! 1
+                                     return $ Bool $ left `op` right
+
+-- определение типа распаковки для каждой функции
+numBoolBinOp = boolBinOp unpackNum
+strBoolBinOp = boolBinOp unpackStr
+boolBoolBinOp = boolBinOp unpackBool
+
+-- вытаскивание строки из LispValues
+unpackStr :: LispValues -> ThrowsError String
+unpackStr (String s) = return s
+-- конвертирование числа и булевой переменной в строку методом show
+unpackStr (Number s) = return $ show s
+unpackStr (Bool s) = return $ show s
+-- выкидывание ошибки, если попалась не строка
+unpackStr notString = throwError $ TypeMismatch "string" notString
+
+-- вытаскивание булевой переменной из LispValues
+unpackBool :: LispValues -> ThrowsError Bool
+unpackBool (Bool b) = return b
+-- выкидывание ошибки, если попалась не булева переменная
+unpackBool notBool = throwError $ TypeMismatch "boolean" notBool
+
+-- вытаскивание числа из LispValues
+unpackNum :: LispValues -> ThrowsError Integer
+unpackNum (Number n) = return n
+-- reads возвращает список пар - распарсенное значение и оригинальное значение,
+-- и в дальнейшем возвращается нулевой элемент из этой пары
+-- fst возвращает первый элемент из кортежа 
+unpackNum (String n) = let parsed = reads n in 
+                          if null parsed 
+                          	-- выкидывание ошибки, если ничего не удалось распарсить
+                            then throwError $ TypeMismatch "number" $ String n
+                            else return $ fst $ parsed !! 0
+unpackNum (List [n]) = unpackNum n
+-- выкидывание ошибки, если попалось не число
+unpackNum notNum = throwError $ TypeMismatch "number" notNum
+
+-- создание нового типа, где перечисляются конструкторы возможных ошибок
+data LispError = NumArgs Integer [LispValues]
+               | TypeMismatch String LispValues
+               | Parser ParseError
+               | BadSpecialForm String LispValues
+               | NotFunction String String
+               | UnboundVar String String
+               | Default String
+
+-- вывод ошибок в зависимости от их типа
+showError :: LispError -> String
+showError (UnboundVar message varname) = message ++ ": " ++ varname
+showError (BadSpecialForm message form) = message ++ ": " ++ show form
+showError (NotFunction message func) = message ++ ": " ++ show func
+showError (NumArgs expected found) = "Expected " ++ show expected 
+                                  ++ " args; found values " ++ unwordsList found
+showError (TypeMismatch expected found) = "Invalid type: expected " ++ expected
+                                       ++ ", found " ++ show found
+showError (Parser parseErr) = "Parse error at " ++ show parseErr
+
+-- добавление LispError в члены класса Show и определение метода show как showError
+instance Show LispError where show = showError
+
+-- добавление LispError в члены класса Error
+-- если ошибка - ничего не выдает, выводится строка "An error has occurred"
+-- иначе остается та строка, которая выводится ошибкой
+instance Error LispError where
+     noMsg = Default "An error has occurred"
+     strMsg = Default
+
+-- определение типа для представления функции, 
+-- которая может выкинуть ошибку LispError или вернуть значение 
+type ThrowsError = Either LispError
+
+-- вспомогательная функция, которая конвертирует все ошибки в строковое представление и 
+-- возвращает их как нормальное значение
+-- результат вызова функции trapError - это другой Either, который всегда имеет валидное значение
+trapError action = catchError action (return . show)
+
+-- извлечение данных из монады Either
+extractValue :: ThrowsError a -> a
+extractValue (Right value) = value
+
+-- функция из Lisp, которая делит список на первый элемент и остальные и возвращает первый элемент
+car :: [LispValues] -> ThrowsError LispValues
+car [List (x : xs)] = return x
+car [DottedList (x : xs) _] = return x
+-- выкидывание ошибок
+car [badArg] = throwError $ TypeMismatch "pair" badArg
+car badArgList = throwError $ NumArgs 1 badArgList
+
+-- функция из Lisp, которая делит список на первый элемент и остальные и 
+-- возвращает список из остальных элементов
+cdr :: [LispValues] -> ThrowsError LispValues
+cdr [List (x : xs)] = return $ List xs
+cdr [DottedList (_ : xs) x] = return $ DottedList xs x
+-- выкидывание ошибок
+cdr [badArg] = throwError $ TypeMismatch "pair" badArg
+cdr badArgList = throwError $ NumArgs 1 badArgList
+
+-- функция из Lisp, которая добавляет элемент в начало списка
+cons :: [LispValues] -> ThrowsError LispValues
+cons [x1, List []] = return $ List [x1]
+cons [x, List xs] = return $ List $ [x] ++ xs
+cons [x, DottedList xs xlast] = return $ DottedList ([x] ++ xs) xlast
+cons [x1, x2] = return $ DottedList [x1] x2
+-- выкидывание ошибки
+cons badArgList = throwError $ NumArgs 2 badArgList
+
+-- функция из Lisp, которая проверяет равенство двух аргументов и возвращает булево значение
+eqv :: [LispValues] -> ThrowsError LispValues
+eqv [(Bool arg1), (Bool arg2)] = return $ Bool $ arg1 == arg2
+eqv [(Number arg1), (Number arg2)] = return $ Bool $ arg1 == arg2
+eqv [(String arg1), (String arg2)] = return $ Bool $ arg1 == arg2
+eqv [(Atom arg1), (Atom arg2)] = return $ Bool $ arg1 == arg2
+eqv [(DottedList xs x), (DottedList ys y)] = eqv [List $ xs ++ [x], List $ ys ++ [y]]
+-- length осуществляет проверку длин списков
+-- zip поэлементно склеивает аргументы в кортежи
+eqv [(List arg1), (List arg2)] = return $ Bool $ (length arg1 == length arg2) && 
+                                                    (and $ map eqvPair $ zip arg1 arg2)
+    where eqvPair (x1, x2) = case eqv [x1, x2] of
+                               Left err -> False
+                               Right (Bool value) -> value
+eqv [_, _] = return $ Bool False
+-- выкидывание ошибки
+eqv badArgList = throwError $ NumArgs 2 badArgList
+
+-- определение нового типа данных, который может хранить любую функцию из LispValues
+data Unpacker = forall a. Eq a => AnyUnpacker (LispValues -> ThrowsError a)
+
+-- распаковывание аргументов из LispValues
+unpackEquals :: LispValues -> LispValues -> Unpacker -> ThrowsError Bool
+unpackEquals arg1 arg2 (AnyUnpacker unpacker) = 
+             do unpacked1 <- unpacker arg1
+                unpacked2 <- unpacker arg2
+                return $ unpacked1 == unpacked2
+        `catchError` (const $ return False)
+
+-- функция из Lisp, которая сравнивает эквивалентность аргументов
+-- liftM продвигает функцию в монаду
+equal :: [LispValues] -> ThrowsError LispValues
+equal [arg1, arg2] = do
+    primitiveEquals <- liftM or $ mapM (unpackEquals arg1 arg2) 
+                      [AnyUnpacker unpackNum, AnyUnpacker unpackStr, AnyUnpacker unpackBool]
+    eqvEquals <- eqv [arg1, arg2]
+    return $ Bool $ (primitiveEquals || let (Bool x) = eqvEquals in x)
+equal badArgList = throwError $ NumArgs 2 badArgList
+
+-- немедленно очищает поток, в противном случае вывод может храниться в буферах вывода,
+-- и юзер никогда не увидит запросы и результаты
+flushStr :: String -> IO ()
+flushStr str = putStr str >> hFlush stdout
+
+-- считывает строки с консоли
+readPrompt :: String -> IO String
+readPrompt prompt = flushStr prompt >> getLine
+
+-- отлавливает ошибку, которая может возникнуть при неправильном вводе
+evalString :: Env -> String -> IO String
+evalString env expr = runIOThrows $ liftM show $ (liftThrows $ readExpr expr) >>= evaluate env
+
+-- вычисляет выражение и выводит результат
+evalAndPrint :: Env -> String -> IO ()
+evalAndPrint env expr =  evalString env expr >>= putStrLn
+
+-- ждет аргументы до тех пор, пока не введется "quit"
+until_ :: Monad m => (a -> Bool) -> m a -> (a -> m ()) -> m ()
+until_ pred prompt action = do 
+  result <- prompt
+  if pred result 
+     then return ()
+     else action result >> until_ pred prompt action
+
+-- вычисление аргумента
+runOne :: String -> IO ()
+runOne expr = primitiveBindings >>= flip evalAndPrint expr
+
+-- выводит строчку "Scheme>>> " и выполняет операции до тех пор, пока не введется "quit"
+runRepl :: IO ()
+runRepl = primitiveBindings >>= until_ (== "quit") (readPrompt "Scheme>>> ") . evalAndPrint
+
+-- объявление типа Env, который хранит список пар: название переменной и ее значение
+type Env = IORef [(String, IORef LispValues)]
+
+-- пустое начальное состояние среды
+nullEnv :: IO Env
+nullEnv = newIORef []
+
+-- помещает примитивные функции в среду
+-- flip меняет аргументы местами
+primitiveBindings :: IO Env
+primitiveBindings = nullEnv >>= (flip bindVars $ map makePrimitiveFunc primitives)
+    where makePrimitiveFunc (var, func) = (var, PrimitiveFunc func)
+
+-- новый тип, который объединяет 2 монады и использует их функционал
+type IOThrowsError = ErrorT LispError IO
+
+-- либо снова выкидывает ошибку, либо возвращает значение
+liftThrows :: ThrowsError a -> IOThrowsError a
+liftThrows (Left err) = throwError err
+liftThrows (Right value) = return value
+
+-- вспомогательная функция для выкидывания ошибки
+runIOThrows :: IOThrowsError String -> IO String
+runIOThrows action = runErrorT (trapError action) >>= return . extractValue
+
+-- возвращает булеву переменную в зависимости от нахождения переменной в среде или ненахождения
+isBound :: Env -> String -> IO Bool
+isBound envRef var = readIORef envRef >>= return . maybe False (const True) . lookup var
+
+-- получение значения переменной из среды
+getVar :: Env -> String -> IOThrowsError LispValues
+getVar envRef var  =  do env <- liftIO $ readIORef envRef
+                         maybe (throwError $ UnboundVar "Getting an unbound variable" var)
+                               (liftIO . readIORef)
+                               (lookup var env)
+
+-- задает определенное значение определенной переменной
+setVar :: Env -> String -> LispValues -> IOThrowsError LispValues
+setVar envRef var val = do env <- liftIO $ readIORef envRef
+                           maybe (throwError $ UnboundVar "Setting an unbound variable" var) 
+                                 (liftIO . (flip writeIORef val))
+                                 (lookup var env)
+                           return val
+
+-- объявление переменной в среде
+defineVar :: Env -> String -> LispValues -> IOThrowsError LispValues
+defineVar envRef var val = do 
+    alreadyDefined <- liftIO $ isBound envRef var 
+    if alreadyDefined 
+       then setVar envRef var val >> return val
+       else liftIO $ do 
+          valueRef <- newIORef val
+          env <- readIORef envRef
+          writeIORef envRef ((var, valueRef) : env)
+          return val
+
+-- связывание переменных в среде
+bindVars :: Env -> [(String, LispValues)] -> IO Env
+bindVars envRef bindings = readIORef envRef >>= extendEnv bindings >>= newIORef
+    where extendEnv bindings env = liftM (++ env) (mapM addBinding bindings)
+          addBinding (var, val) = do ref <- newIORef val
+                                     return (var, ref)
+
+-- создание функции с определенными параметрами
+makeFunc varargs env params body = return $ Func (map showValue params) varargs body env
+makeNormalFunc = makeFunc Nothing
+makeVarargs = makeFunc . Just . showValue
